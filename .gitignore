@@ -7,3 +7,4 @@ output.jsonl
 .venv/
 sqlglot-source/
 # map.json.gz is intentionally NOT ignored: commit the baseline index.
+.rwx-final/

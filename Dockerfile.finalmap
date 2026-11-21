@@ -1,0 +1,15 @@
+# Preprocessing only; preserve earlier layers so existing downloads are reused.
+FROM alpine/git:latest AS source
+RUN git init /sqlglot \
+    && cd /sqlglot \
+    && git remote add origin https://github.com/tobymao/sqlglot.git \
+    && git fetch --depth 1 origin eb11aec4be8cb2122afe713a4816662c3f0fb2fa \
+    && git checkout --detach FETCH_HEAD
+
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS mapbuild
+ENV PYTHONDONTWRITEBYTECODE=1 SKIP_INTEGRATION=0
+COPY requirements.lock /app/requirements.lock
+RUN pip install --no-cache-dir -r /app/requirements.lock
+COPY --from=source /sqlglot /opt/sqlglot
+COPY trace_map.py collect_map.py /app/
+COPY trace_v2.py worker_trace.py collect_final.py /app/

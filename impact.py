@@ -28,6 +28,7 @@ SOURCE_OBSERVERS = {
     "read_text", "read_bytes", "__code__", "co_firstlineno", "co_linetable",
     "co_lines", "co_positions", "f_lineno", "tb_lineno", "format_exc",
     "format_exception", "extract_tb", "_getframe", "currentframe", "stack",
+    "__doc__", "__annotations__", "__defaults__", "__kwdefaults__", "__signature__",
 }
 
 
@@ -39,12 +40,19 @@ def source_observer_tests(mapping, all_test_ids):
     """
     result = set()
     contexts = mapping["contexts"]
+    precise_reads = mapping.get("explicit_source_reads", False)
     for entry in mapping["files"].values():
         source = entry.get("source", "")
         if not any(name in source for name in SOURCE_OBSERVERS):
             continue
         for node in ast.walk(ast.parse(source)):
             if isinstance(node, ast.Attribute) and node.attr in SOURCE_OBSERVERS:
+                if precise_reads and node.attr in {"read_text", "read_bytes"}:
+                    continue  # Use actual .py file readers, not arbitrary data reads.
+                if precise_reads and node.attr == "stack" and not (
+                    isinstance(node.value, ast.Name) and node.value.id == "inspect"
+                ):
+                    continue  # SQL/parser stacks are not Python stack inspection.
                 lo, hi = node.lineno, node.end_lineno
             elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                   and node.func.id in SOURCE_OBSERVERS):
@@ -151,7 +159,7 @@ def lambda_body_change(old_tree, new_tree, touched):
                         break
                     parent = parents.get(parent)
                 inline = old_body.lineno == old_body.end_lineno == old.lineno
-                return old_body.lineno, old_body.end_lineno, binding, inline
+                return old_body.lineno, old_body.end_lineno, binding, inline, old.lineno
         finally:
             old.body, new.body = old_body, new_body
     return None
@@ -167,7 +175,12 @@ def untraced_dispatch_tests(mapping, all_test_ids):
     """
     result = set()
     contexts = mapping["contexts"]
-    for entry in mapping["files"].values():
+    proof = mapping.get("process_capture", {})
+    certified = (proof.get("version") == 1 and proof.get("complete") is True
+                 and proof.get("expected_tasks", 0) > 0
+                 and proof.get("expected_tasks") == proof.get("completed_tasks"))
+    handled_sites = proof.get("handled_sites", {}) if certified else {}
+    for path, entry in mapping["files"].items():
         source = entry.get("source", "")
         if not any(name in source for name in CONCURRENCY_MODULES):
             continue
@@ -194,8 +207,14 @@ def untraced_dispatch_tests(mapping, all_test_ids):
             else:
                 is_dispatch = False
             if is_dispatch:
+                names = set()
+                handled = set()
                 for lineno in range(node.lineno, node.end_lineno + 1):
-                    result.update(contexts[n] for n in entry["lines"].get(str(lineno), []))
+                    names.update(contexts[n] for n in entry["lines"].get(str(lineno), []))
+                    handled.update(handled_sites.get(path, {}).get(str(lineno), []))
+                # Only remove the test/site pairs whose real submitted tasks
+                # were all captured. Other subprocess sites remain protected.
+                result.update(names - handled)
     return set(all_test_ids) if GLOBAL in result else result & all_test_ids
 
 
@@ -390,21 +409,27 @@ class Selector:
                 new_source, touched = apply_to_source(entry["source"], change)
                 old_tree = ast.parse(entry["source"], type_comments=True)
                 new_tree = ast.parse(new_source, type_comments=True)
+                if encoding_of(entry["source"]) != encoding_of(new_source):
+                    raise ValueError("source encoding changed")
+                old_first = entry["source"].splitlines()[:1]
+                new_first = new_source.splitlines()[:1]
+                if old_first != new_first and any(s.startswith("#!") for s in old_first + new_first):
+                    raise ValueError("executable shebang changed")
+                if self.mapping.get("explicit_source_reads"):
+                    selected.update(self.source_tests)
+                    add(entry["reads"])
                 if "ast_equal" in self.features and same_ast(old_tree, new_tree):
                     # A changed cookie/shebang can alter how the file is loaded,
                     # even though parsing the already-decoded text agrees.
-                    if encoding_of(entry["source"]) != encoding_of(new_source):
-                        raise ValueError("source encoding changed")
-                    old_first = entry["source"].splitlines()[:1]
-                    new_first = new_source.splitlines()[:1]
-                    if old_first != new_first and any(s.startswith("#!") for s in old_first + new_first):
-                        raise ValueError("executable shebang changed")
                     selected.update(self.source_tests)
+                    if self.mapping.get("explicit_source_reads"):
+                        add(entry["reads"])
                     refinements.add("ast-equal-with-source-observers")
                     continue
                 selected.update(self.dispatch_tests)
                 used_dispatch_safety = bool(self.dispatch_tests)
-                literal = literal_class_change(old_tree, new_tree, touched) if "literal" in self.features else None
+                literal = (literal_class_change(old_tree, new_tree, touched)
+                           if "literal" in self.features and not self.mapping.get("conservative_initialization") else None)
                 if literal:
                     readers = self.attribute_readers(literal)
                     if not readers:
@@ -414,13 +439,16 @@ class Selector:
                     continue
                 lambda_span = lambda_body_change(old_tree, new_tree, touched) if "lambda" in self.features else None
                 if lambda_span:
-                    a, b, binding, inline = lambda_span
+                    a, b, binding, inline, firstline = lambda_span
                     body_contexts = set()
                     for n, covered in entry["lines"].items():
                         if a <= int(n) <= b:
                             body_contexts.update(covered)
                     body_names = {contexts[n] for n in body_contexts} & self.all_ids
-                    if inline or not body_names:
+                    entry_contexts = entry.get("entries", {}).get(str(firstline), [])
+                    if self.mapping.get("function_block_selection") and entry_contexts:
+                        add(entry_contexts)
+                    elif inline or not body_names:
                         if not binding:
                             raise ValueError("lambda has no reliable body coverage or storage binding")
                         readers = self.attribute_readers(binding)
@@ -441,7 +469,24 @@ class Selector:
                     if not functions:
                         raise ValueError("module/class/definition-level edit")
                     direct = entry["lines"].get(str(lineno), [])
-                    if direct:
+                    if self.mapping.get("function_block_selection"):
+                        a, b = min(functions, key=lambda x: x[1] - x[0])
+                        owner = next((node for node in ast.walk(old_tree)
+                                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                      and node.lineno == a and node.end_lineno == b), None)
+                        if owner is None or lineno < owner.body[0].lineno:
+                            raise ValueError("function signature/default/annotation edit")
+                        block = set()
+                        for n, covered in entry["lines"].items():
+                            if a < int(n) <= b:
+                                block.update(covered)
+                        for n, covered in entry.get("entries", {}).items():
+                            if a <= int(n) <= b:
+                                block.update(covered)
+                        if not block:
+                            raise ValueError("changed function has no attributable baseline execution")
+                        add(block)
+                    elif direct:
                         add(direct)
                     else:
                         # Uncovered changed line / inserted line / comment:
